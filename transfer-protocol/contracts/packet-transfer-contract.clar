@@ -1,5 +1,5 @@
 ;; DECENTRALIZED-MESSAGE-EXCHANGE - STAGE 3
-;; Complete implementation with comprehensive maintenance features
+;; Implementation with comprehensive maintenance features
 
 ;; Result indicators
 (define-constant RESULT-IDENTITY-NOT-FOUND u300)
