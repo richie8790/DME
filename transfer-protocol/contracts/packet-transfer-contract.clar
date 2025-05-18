@@ -1,5 +1,5 @@
-;; DECENTRALIZED-MESSAGE-EXCHANGE - STAGE 1
-;; Basic implementation with core identity and messaging features
+;; DECENTRALIZED-MESSAGE-EXCHANGE - STAGE 2
+;; Enhanced implementation with channels and message expiration
 
 ;; Result indicators
 (define-constant RESULT-IDENTITY-NOT-FOUND u300)
@@ -7,10 +7,18 @@
 (define-constant RESULT-PERMISSION-REJECTED u302)
 (define-constant RESULT-MESSAGE-NOT-FOUND u303)
 (define-constant RESULT-MESSAGE-SIZE-EXCEEDED u304)
+(define-constant RESULT-KEY-VERIFICATION-FAILED u305)
+(define-constant RESULT-OPERATION-FAILED u306)
+(define-constant RESULT-CHANNEL-NOT-FOUND u307)
+(define-constant RESULT-CHANNEL-ALREADY-EXISTS u308)
+(define-constant RESULT-SELF-CHANNEL-FORBIDDEN u309)
+(define-constant RESULT-MESSAGE-TIMEOUT u310)
 
 ;; Framework parameters
 (define-constant MESSAGE-LENGTH-MAX u1024)
 (define-constant ENCRYPTION-KEY-SIZE u33)
+(define-constant CHANNEL-CAPACITY u100)
+(define-constant STANDARD-TIMEOUT-BLOCKS u1440) ;; ~10 days (10 min blocks)
 
 ;; FRAMEWORK STATE
 (define-data-var framework-admin principal tx-sender)
@@ -36,11 +44,16 @@
     encrypted-data: (buff 1024),
     timestamp-created: uint,
     received: bool,
-    timestamp-received: (optional uint)
+    timestamp-received: (optional uint),
+    expiration-block: uint,
+    message-type: (string-utf8 20)  ;; "standard", "confidential", etc.
   }
 )
 
 (define-map identity-inbox principal (list 50 uint))
+
+;; Authorized channels between identities
+(define-map identity-channels principal (list 100 principal))
 
 ;; QUERY OPERATIONS
 (define-read-only (get-identity-info (entity principal))
@@ -76,9 +89,40 @@
   (default-to (list) (map-get? identity-inbox entity))
 )
 
+(define-read-only (get-message-count)
+  (var-get message-sequence)
+)
+
+(define-read-only (get-identity-channels (entity principal))
+  (default-to (list) (map-get? identity-channels entity))
+)
+
+;; Check if message is still valid
+(define-read-only (is-message-valid (msg-id uint))
+  (let (
+    (message-data (unwrap! (get-message-by-id msg-id) false))
+    (current-block (get-block-height))
+  )
+    (< current-block (get expiration-block message-data))
+  )
+)
+
+;; Check if a channel exists between identities
+(define-read-only (is-channel-active (source principal) (target principal))
+  (let (
+    (channels (get-identity-channels source))
+  )
+    (is-some (index-of channels target))
+  )
+)
+
 ;; Helper functions for block info
 (define-private (get-block-time)
   (default-to u0 (get-block-info? time u0))
+)
+
+(define-private (get-block-height)
+  (default-to u0 (get-block-info? id u0))
 )
 
 ;; IDENTITY MANAGEMENT
@@ -136,13 +180,20 @@
 )
 
 ;; MESSAGING OPERATIONS
-(define-public (send-message (to-identity principal) (encrypted-content (buff 1024)))
+(define-public (send-message (to-identity principal) 
+                          (encrypted-content (buff 1024))
+                          (message-class (string-utf8 20))
+                          (timeout-period uint))
   (let (
     (caller tx-sender)
     (sender-info (get-identity-info caller))
     (recipient-info (get-identity-info to-identity))
     (msg-id (var-get message-sequence))
     (current-time (get-block-time))
+    (current-block (get-block-height))
+    (timeout-block (if (> timeout-period u0) 
+                   (+ current-block timeout-period)
+                   (+ current-block STANDARD-TIMEOUT-BLOCKS)))
     (recipient-inbox (get-identity-inbox to-identity))
   )
     ;; Validate both identities exist
@@ -150,6 +201,10 @@
               (err RESULT-IDENTITY-NOT-FOUND))
     (asserts! (get active recipient-info) 
               (err RESULT-IDENTITY-NOT-FOUND))
+    
+    ;; Verify channel exists
+    (asserts! (is-channel-active caller to-identity)
+              (err RESULT-PERMISSION-REJECTED))
     
     ;; Store the message
     (map-set message-ledger msg-id
@@ -159,7 +214,9 @@
         encrypted-data: encrypted-content,
         timestamp-created: current-time,
         received: false,
-        timestamp-received: none
+        timestamp-received: none,
+        expiration-block: timeout-block,
+        message-type: message-class
       }
     )
     
@@ -195,11 +252,16 @@
     (message-data (unwrap! (get-message-by-id msg-id) 
                      (err RESULT-MESSAGE-NOT-FOUND)))
     (current-time (get-block-time))
+    (current-block (get-block-height))
     (inbox-items (get-identity-inbox caller))
   )
     ;; Verify caller is recipient
     (asserts! (is-eq (get recipient message-data) caller) 
               (err RESULT-PERMISSION-REJECTED))
+    
+    ;; Check expiration
+    (asserts! (< current-block (get expiration-block message-data))
+              (err RESULT-MESSAGE-TIMEOUT))
     
     ;; Update receipt status
     (map-set message-ledger msg-id
@@ -225,9 +287,100 @@
   )
 )
 
+(define-public (delete-message (msg-id uint))
+  (let (
+    (caller tx-sender)
+    (message-data (unwrap! (get-message-by-id msg-id) 
+                     (err RESULT-MESSAGE-NOT-FOUND)))
+    (current-time (get-block-time))
+  )
+    ;; Verify caller is sender or recipient
+    (asserts! (or 
+               (is-eq (get sender message-data) caller)
+               (is-eq (get recipient message-data) caller))
+             (err RESULT-PERMISSION-REJECTED))
+    
+    ;; If recipient is deleting, update inbox if needed
+    (if (and 
+         (is-eq (get recipient message-data) caller)
+         (not (get received message-data)))
+        (map-set identity-inbox 
+                 caller 
+                 (filter not-matching-id 
+                         (get-identity-inbox caller)))
+        true)
+    
+    ;; Delete the message
+    (map-delete message-ledger msg-id)
+    
+    ;; Update activity timestamp
+    (map-set identity-directory caller
+      (merge (get-identity-info caller) { 
+        recent-activity: current-time
+      })
+    )
+    
+    (ok true)
+  )
+)
+
 ;; Helper function for filtering items
 (define-private (not-matching-id (id uint))
   (not (is-eq id msg-id))
+)
+
+;; CHANNEL MANAGEMENT
+(define-public (open-channel (target-identity principal))
+  (let (
+    (caller tx-sender)
+    (caller-info (get-identity-info caller))
+    (target-info (get-identity-info target-identity))
+    (current-channels (get-identity-channels caller))
+  )
+    ;; Verify both identities exist
+    (asserts! (get active caller-info) 
+              (err RESULT-IDENTITY-NOT-FOUND))
+    (asserts! (get active target-info) 
+              (err RESULT-IDENTITY-NOT-FOUND))
+    
+    ;; Prevent self-channel
+    (asserts! (not (is-eq caller target-identity))
+              (err RESULT-SELF-CHANNEL-FORBIDDEN))
+    
+    ;; Check if channel already exists
+    (asserts! (not (is-channel-active caller target-identity))
+              (err RESULT-CHANNEL-ALREADY-EXISTS))
+    
+    ;; Add channel
+    (map-set identity-channels 
+             caller 
+             (append current-channels target-identity))
+    
+    (ok true)
+  )
+)
+
+(define-public (close-channel (target-identity principal))
+  (let (
+    (caller tx-sender)
+    (current-channels (get-identity-channels caller))
+  )
+    ;; Check if channel exists
+    (asserts! (is-channel-active caller target-identity)
+              (err RESULT-CHANNEL-NOT-FOUND))
+    
+    ;; Remove channel
+    (map-set identity-channels 
+             caller 
+             (filter not-matching-channel current-channels))
+    
+    (ok true)
+  )
+)
+
+;; Helper function for filtering channels
+(define-private (not-matching-channel (entity principal))
+  (not (is-eq entity target-identity))
 )
 
 ;; ADMINISTRATION FUNCTIONS
@@ -236,6 +389,16 @@
     ;; Only admin can initialize
     (asserts! (is-eq tx-sender (var-get framework-admin)) 
               (err RESULT-PERMISSION-REJECTED))
+    (ok true)
+  )
+)
+
+(define-public (change-admin (new-admin principal))
+  (begin
+    ;; Only current admin can transfer
+    (asserts! (is-eq tx-sender (var-get framework-admin)) 
+              (err RESULT-PERMISSION-REJECTED))
+    (var-set framework-admin new-admin)
     (ok true)
   )
 )
